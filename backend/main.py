@@ -3,11 +3,13 @@ Decisions: business rules live in grade()/statuses()/issue_certificate() (plain 
 routes are thin. Modules unlock one after another via statuses(). Certificate number = hash(user, course),
 so it is deterministic. Emails are sent as background tasks (notify.py). The first registered user becomes admin."""
 import os, io, random, hashlib, datetime as dt, jwt
+from pathlib import Path
 from datetime import date
 from typing import Optional
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
+from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBearer
 from pydantic import BaseModel, Field
 from sqlalchemy import (create_engine, event, func, Column, Integer, String, Boolean, Text, Date,
@@ -23,6 +25,10 @@ except ImportError:
 URL = os.getenv("DATABASE_URL") or _SAURL.create(
     "postgresql+psycopg", username="postgres", password=_DB_PASSWORD,
     host="localhost", port=5432, database="training").render_as_string(hide_password=False)
+if URL.startswith("postgres://"):
+    URL = "postgresql+psycopg://" + URL[len("postgres://"):]
+elif URL.startswith("postgresql://") and not URL.startswith("postgresql+"):
+    URL = "postgresql+psycopg://" + URL[len("postgresql://"):]
 SECRET = os.getenv("JWT_SECRET", "dev-secret")
 kw = dict(connect_args={"check_same_thread": False}, poolclass=StaticPool) if URL.startswith("sqlite") else {}
 engine = create_engine(URL, **kw); Session = sessionmaker(engine); Base = declarative_base()
@@ -100,7 +106,8 @@ def issue_certificate(db, enr):
 
 # ---------- API ----------
 app = FastAPI(title="Training Platform")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_methods=["*"], allow_headers=["*"])
+cors_origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "*").split(",") if origin.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_methods=["*"], allow_headers=["*"])
 Base.metadata.create_all(engine)
 bearer = HTTPBearer()
 
@@ -290,7 +297,7 @@ def certificate(cid: int, bg: BackgroundTasks, u=Depends(user), db=Depends(get_d
     if not had:
         bg.add_task(send_email, u.email, "Your certificate is ready",
                     f"Hello {u.name},\n\nCongratulations! Your certificate number is {c.number} (final score {c.score}%).\n"
-                    f"Download it: http://localhost:8000/certificates/{c.number}/pdf")
+                    f"Download it: /certificates/{c.number}/pdf")
     return {"number": c.number, "score": c.score}
 @app.get("/certificates/{number}", response_class=HTMLResponse)
 def view_cert(number: str, db=Depends(get_db)):  # public, verifiable; print to PDF from browser
@@ -395,3 +402,7 @@ def google_login(b: GoogleLogin, db=Depends(get_db)):
                  role="admin" if db.query(User).count() == 0 else "user")
         db.add(u); db.commit()
     return {"token": jwt.encode({"sub": str(u.id)}, SECRET, "HS256"), "role": u.role, "name": u.name}
+
+frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+if frontend_dist.is_dir():
+    app.mount("/", StaticFiles(directory=str(frontend_dist), html=True), name="frontend")
